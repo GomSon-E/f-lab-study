@@ -198,9 +198,11 @@ async def create_memo(request: MemoCreateRequest) -> Dict[str, Any]:
 
     print("\n📝 메모 생성")
     print(f"   title='{request.title}'")
+    print(f"   description='{request.description}'")
+    print(f"   completed={request.completed}")
 
     try:
-        payload = request.model_dump()
+        payload = request.model_dump(exclude_unset=False)
         response = await _request("POST", "/todos/", json=payload)
         memo = response.json()
         print(f"   ✅ 메모 생성 완료 (id={memo.get('id')})")

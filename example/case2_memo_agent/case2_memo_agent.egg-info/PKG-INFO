@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: case2-memo-agent
+Version: 0.1.0
+Summary: FastMCP server that exposes memo FastAPI endpoints as MCP tools
+Requires-Python: <3.14,>=3.11
+Requires-Dist: fastmcp>=0.4.0
+Requires-Dist: httpx>=0.27
+Requires-Dist: python-dotenv>=1.0
+Requires-Dist: pydantic>=2.8
+Requires-Dist: langchain>=0.3.0
+Requires-Dist: langgraph>=0.2.51
+Requires-Dist: langchain-openai>=0.2.5
+Requires-Dist: langchain-mcp>=0.1.1
+Requires-Dist: langchain-mcp-adapters>=0.1.13
+Requires-Dist: langfuse>=2.0.0

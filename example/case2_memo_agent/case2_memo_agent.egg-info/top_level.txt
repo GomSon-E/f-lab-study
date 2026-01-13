@@ -1,0 +1,2 @@
+memo_agent
+memo_mcp_server

@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Annotated, Any, Dict, List, cast
+from typing import Annotated, Any, Dict, List, Optional, cast
 
 from dotenv import load_dotenv
 from langchain_core.messages import (
@@ -20,11 +20,52 @@ from langchain_mcp_adapters.sessions import StreamableHttpConnection
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
+from langfuse.langchain import CallbackHandler
 from typing_extensions import TypedDict
 
 load_dotenv()
 
 EXIT_KEYWORDS = {"exit", "quit", "종료", "그만", "끝", "q"}
+
+
+def _fix_mcp_tool_schema(tool: BaseTool) -> BaseTool:
+    """FastMCP의 nested 'request' schema를 flat하게 펼쳐서 LLM이 직접 호출 가능하도록 변환.
+
+    FastMCP는 Pydantic 모델을 {"request": {"$ref": "#/$defs/Model"}} 형태로 제공하는데,
+    LLM이 직접 필드에 접근할 수 있도록 request 래핑을 제거합니다.
+    """
+    if not hasattr(tool, 'args_schema') or not isinstance(tool.args_schema, dict):
+        return tool
+
+    schema = tool.args_schema.copy()
+
+    # schema에 $defs가 있고, properties에 request.$ref가 있는 경우
+    if '$defs' in schema and 'properties' in schema:
+        props = schema['properties']
+        if 'request' in props and '$ref' in props['request']:
+            # $ref를 resolve
+            ref_path = props['request']['$ref']  # "#/$defs/MemoCreateRequest"
+            if ref_path.startswith('#/$defs/'):
+                def_name = ref_path.split('/')[-1]
+                if def_name in schema['$defs']:
+                    # request 객체의 내용을 최상위로 이동
+                    request_schema = schema['$defs'][def_name]
+
+                    # properties를 request의 properties로 대체
+                    schema['properties'] = request_schema.get('properties', {})
+
+                    # required도 request의 것으로 대체
+                    schema['required'] = request_schema.get('required', [])
+
+                    # title과 description도 복사
+                    if 'title' in request_schema:
+                        schema['title'] = request_schema['title']
+                    if 'description' in request_schema:
+                        schema['description'] = request_schema['description']
+
+    # 수정된 schema를 tool에 다시 할당
+    tool.args_schema = schema
+    return tool
 
 
 class AgentState(TypedDict):
@@ -63,11 +104,18 @@ def _build_system_prompt(tool_map: Dict[str, BaseTool]) -> str:
     )
 
 
-def _create_graph(llm: ChatOpenAI, tool_map: Dict[str, BaseTool]) -> StateGraph:
+def _create_graph(
+    llm: ChatOpenAI,
+    tool_map: Dict[str, BaseTool],
+    langfuse_handler: Optional[CallbackHandler] = None,
+) -> StateGraph:
     llm_with_tools = llm.bind_tools(list(tool_map.values()))
 
     async def call_model(state: AgentState) -> AgentState:
-        response = await llm_with_tools.ainvoke(state["messages"])
+        config = {}
+        if langfuse_handler:
+            config["callbacks"] = [langfuse_handler]
+        response = await llm_with_tools.ainvoke(state["messages"], config=config)
         return {"messages": [response]}
 
     async def call_tools(state: AgentState) -> AgentState:
@@ -75,15 +123,24 @@ def _create_graph(llm: ChatOpenAI, tool_map: Dict[str, BaseTool]) -> StateGraph:
         tool_calls = getattr(last_message, "tool_calls", None) or []
         outputs: List[ToolMessage] = []
 
+        print(f"\n🔧 도구 호출 {tool_calls}")
+
         for call in tool_calls:
             tool_name = call.get("name")
             tool_args = call.get("args") or {}
+            print(f"   도구 이름: {tool_name}, 인자: {_stringify(tool_args)}")
             tool_call_id = call.get("id", tool_name or "tool-call")
             tool = tool_map.get(tool_name or "")
             if tool is None:
                 error_text = f"{tool_name} 도구를 찾을 수 없습니다."
                 outputs.append(ToolMessage(content=error_text, tool_call_id=tool_call_id))
                 continue
+
+            # LLM은 flat arguments를 보내지만, MCP 서버는 request 객체를 기대함
+            # schema를 flat하게 펼쳤으므로, 다시 request로 래핑
+            if tool_name in ["create_memo", "update_memo", "list_memos", "get_memo", "delete_memo"]:
+                if "request" not in tool_args:
+                    tool_args = {"request": tool_args}
 
             print(f"🛠️  {tool_name} 호출: {_stringify(tool_args)}")
             try:
@@ -139,11 +196,32 @@ def _get_memo_mcp_url() -> str:
     return f"http://{host}:{port}/mcp"
 
 
-async def prepare_agent() -> tuple[StateGraph, AgentState]:
+async def prepare_agent() -> tuple[StateGraph, AgentState, Optional[CallbackHandler]]:
     openai_api_key = os.getenv("OPENAI_API_KEY")
     if not openai_api_key:
         raise RuntimeError("OPENAI_API_KEY 환경 변수를 설정하세요.")
     model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    # LangFuse 설정 - 환경 변수에서 자동으로 읽음
+    # LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST/LANGFUSE_BASE_URL
+    langfuse_handler = None
+    langfuse_public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+    langfuse_secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+    langfuse_host = os.getenv("LANGFUSE_HOST") or os.getenv("LANGFUSE_BASE_URL")
+
+    if langfuse_public_key and langfuse_secret_key:
+        try:
+            # 환경 변수를 통해 Langfuse 클라이언트가 자동으로 초기화됨
+            langfuse_handler = CallbackHandler()
+            print(f"✅ LangFuse 통합 활성화")
+            print(f"   Host: {langfuse_host or 'https://cloud.langfuse.com'}")
+            print(f"   Public Key: {langfuse_public_key[:20]}...")
+        except Exception as e:
+            print(f"⚠️  LangFuse 초기화 실패: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("ℹ️  LangFuse 비활성화 (환경 변수 미설정)")
 
     server_name = os.getenv("MEMO_MCP_SERVER_NAME", "memo")
     server_url = _get_memo_mcp_url()
@@ -159,20 +237,24 @@ async def prepare_agent() -> tuple[StateGraph, AgentState]:
     if not tools:
         raise RuntimeError("MCP 서버에서 사용할 수 있는 도구를 찾지 못했습니다.")
 
+    # FastMCP의 nested schema를 수정
+    tools = [_fix_mcp_tool_schema(tool) for tool in tools]
+    print(f'💜 tools 출력 {tools}')
+
     tool_map = {tool.name: tool for tool in tools}
     system_prompt = _build_system_prompt(tool_map)
 
     llm = ChatOpenAI(model=model_name, temperature=0.2)
-    graph = _create_graph(llm, tool_map)
+    graph = _create_graph(llm, tool_map, langfuse_handler)
 
     base_state: AgentState = {
         "messages": [SystemMessage(content=system_prompt)],
     }
-    return graph, base_state
+    return graph, base_state, langfuse_handler
 
 
 async def run_cli() -> None:
-    graph, state = await prepare_agent()
+    graph, state, langfuse_handler = await prepare_agent()
     print("✅ LangGraph 메모 에이전트가 준비되었습니다. (종료하려면 '종료', 'exit' 등을 입력하세요)\n")
 
     while True:
@@ -206,6 +288,21 @@ async def run_cli() -> None:
             print(f"에이전트> {ai_message.content}\n")
         else:
             print("에이전트> (응답을 생성하지 못했습니다)\n")
+
+        # 매 턴마다 LangFuse에 데이터 전송
+        if langfuse_handler:
+            try:
+                langfuse_handler.flush()
+            except Exception:
+                pass  # 조용히 무시
+
+    # LangFuse 세션 종료 시 플러시
+    if langfuse_handler:
+        try:
+            langfuse_handler.flush()
+            print("✅ LangFuse 추적 데이터 전송 완료")
+        except Exception as e:
+            print(f"⚠️  LangFuse 플러시 실패: {e}")
 
     print("✅ 세션 종료 완료.")
 
